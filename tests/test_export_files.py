@@ -1,0 +1,275 @@
+"""Tests for the export_files functionality.
+
+Covers:
+  - SandboxManager.export_files (manager layer)
+  - LangChain export_files tool (tool layer)
+
+Requires Docker to be running on the host.
+Run with: pytest tests/test_export_files.py -v
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from taskharbor.sandbox.manager import SandboxManager, current_thread_id
+from taskharbor.sandbox.models import ExportFileResult, ExportResult
+from taskharbor.tools import create_tools
+
+
+def _docker_available() -> bool:
+    try:
+        import docker
+
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _docker_available(),
+    reason="Docker is not available",
+)
+
+
+@pytest.fixture(scope="module")
+def manager(tmp_path_factory):
+    from taskharbor.settings import get_settings
+
+    settings = get_settings()
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(settings, "STORAGE_DIR", tmp_path_factory.mktemp("export-storage"))
+        patcher.setattr(settings, "SANDBOX_STANDALONE_OWNER", "export-test-owner")
+        patcher.setattr(SandboxManager, "_get_db_pool", lambda self: None)
+        mgr = SandboxManager()
+        yield mgr
+        mgr.cleanup_all()
+
+
+@pytest.fixture()
+def python_session(manager: SandboxManager):
+    info = manager.create_session(runtime="python")
+    yield info.session_id
+    manager.stop_session(info.session_id)
+
+
+def _create_file_in_sandbox(manager: SandboxManager, session_id: str, name: str, content: str):
+    """Helper: create a file inside /workspace/ via execute_terminal."""
+    escaped = content.replace("'", "'\\''")
+    manager.execute_terminal(session_id, f"sh -c \"echo '{escaped}' > /workspace/{name}\"")
+
+
+# ── Manager-level tests ───────────────────────────────────────
+
+
+class TestExportFilesManager:
+    def test_export_single_file(self, manager, python_session):
+        _create_file_in_sandbox(manager, python_session, "hello.txt", "hello world")
+
+        result = manager.export_files(
+            python_session,
+            [{"source": "hello.txt", "destination": "hello.txt"}],
+        )
+
+        assert isinstance(result, ExportResult)
+        assert result.success is True
+        assert len(result.files) == 1
+
+        fr = result.files[0]
+        assert isinstance(fr, ExportFileResult)
+        assert fr.success is True
+        assert fr.session_id == python_session
+        assert fr.path == "/workspace/hello.txt"
+        assert fr.size > 0
+
+        # Verify the durable published snapshot is streamable
+        # When current_thread_id is not set, manager uses session_id as thread_key
+        thread_key = python_session
+        assert manager.is_file_exported(thread_key, python_session, fr.path)
+        content = b"".join(manager.stream_exported_file(None, python_session, fr.path))
+        assert b"hello world" in content
+
+    def test_export_multiple_files(self, manager, python_session):
+        _create_file_in_sandbox(manager, python_session, "a.txt", "aaa")
+        _create_file_in_sandbox(manager, python_session, "b.txt", "bbb")
+
+        result = manager.export_files(
+            python_session,
+            [
+                {"source": "a.txt", "destination": "a.txt"},
+                {"source": "b.txt", "destination": "b.txt"},
+            ],
+        )
+
+        assert result.success is True
+        assert len(result.files) == 2
+        assert all(f.success for f in result.files)
+        paths = {f.path for f in result.files}
+        assert "/workspace/a.txt" in paths
+        assert "/workspace/b.txt" in paths
+
+        thread_key = python_session
+        assert manager.is_file_exported(thread_key, python_session, "/workspace/a.txt")
+        assert manager.is_file_exported(thread_key, python_session, "/workspace/b.txt")
+
+    def test_export_absolute_source(self, manager, python_session):
+        _create_file_in_sandbox(manager, python_session, "abs.txt", "absolute")
+
+        result = manager.export_files(
+            python_session,
+            [{"source": "/workspace/abs.txt", "destination": "abs.txt"}],
+        )
+
+        assert result.success is True
+        assert result.files[0].path == "/workspace/abs.txt"
+        content = b"".join(manager.stream_exported_file(None, python_session, "/workspace/abs.txt"))
+        assert b"absolute" in content
+
+    def test_export_nonexistent_file_partial_failure(self, manager, python_session):
+        _create_file_in_sandbox(manager, python_session, "good.txt", "ok")
+
+        result = manager.export_files(
+            python_session,
+            [
+                {"source": "good.txt", "destination": "good.txt"},
+                {"source": "nonexistent.xyz", "destination": "nope.xyz"},
+            ],
+        )
+
+        assert result.success is False
+        assert result.files[0].success is True
+        assert result.files[1].success is False
+        assert result.files[1].error
+
+    def test_export_empty_source_error(self, manager, python_session):
+        result = manager.export_files(
+            python_session,
+            [{"source": "", "destination": "x.txt"}],
+        )
+
+        assert result.success is False
+        assert result.files[0].success is False
+        assert "source is required" in result.files[0].error
+
+    def test_export_directory(self, manager, python_session):
+        manager.execute_terminal(python_session, "mkdir -p /workspace/mydir")
+        _create_file_in_sandbox(manager, python_session, "mydir/f1.txt", "file1")
+        _create_file_in_sandbox(manager, python_session, "mydir/f2.txt", "file2")
+
+        result = manager.export_files(
+            python_session,
+            [{"source": "mydir", "destination": "mydir"}],
+        )
+
+        assert result.success is True
+        assert result.files[0].path == "/workspace/mydir"
+        content = b"".join(manager.stream_exported_file(None, python_session, "/workspace/mydir"))
+        assert content.startswith(b"PK"), "Expected ZIP format"
+        assert b"mydir/f1.txt" in content
+        assert b"mydir/f2.txt" in content
+
+    def test_export_path_traversal_rejected(self, manager, python_session):
+        result = manager.export_files(
+            python_session,
+            [{"source": "/workspace/../etc/passwd", "destination": "x"}],
+        )
+        assert result.success is False
+        assert "outside /workspace" in result.files[0].error
+
+    def test_export_invalid_session(self, manager):
+        with pytest.raises(ValueError, match="not found"):
+            manager.export_files(
+                "nonexistent_id",
+                [{"source": "x", "destination": "x"}],
+            )
+
+    def test_stop_session_preserves_exported_files(self, manager):
+        """Published files stay downloadable without a live compute container."""
+        info = manager.create_session(runtime="python")
+        sid = info.session_id
+        _create_file_in_sandbox(manager, sid, "cleanup_test.txt", "to be removed")
+
+        manager.export_files(sid, [{"source": "cleanup_test.txt"}])
+
+        thread_key = sid
+        assert manager.is_file_exported(thread_key, sid, "/workspace/cleanup_test.txt")
+
+        manager.stop_session(sid)
+
+        assert manager.is_file_exported(thread_key, sid, "/workspace/cleanup_test.txt")
+        content = b"".join(manager.stream_exported_file(None, sid, "/workspace/cleanup_test.txt"))
+        assert b"to be removed" in content
+
+    def test_explicit_thread_delete_removes_persistent_files(self, manager):
+        """Only explicit deletion removes persistent uploads/workspace/artifacts."""
+        token = current_thread_id.set("test_thread_cleanup")
+        try:
+            info = manager.create_session(runtime="python")
+            sid = info.session_id
+            _create_file_in_sandbox(manager, sid, "thread_cleanup.txt", "to be removed")
+            manager.export_files(sid, [{"source": "thread_cleanup.txt"}])
+
+            assert manager.is_file_exported(
+                "test_thread_cleanup", sid, "/workspace/thread_cleanup.txt"
+            )
+
+            manager.cleanup_thread_sessions("test_thread_cleanup")
+            assert manager.is_file_exported(
+                "test_thread_cleanup", sid, "/workspace/thread_cleanup.txt"
+            )
+            manager.cleanup_thread_sessions("test_thread_cleanup", delete_files=True)
+
+            assert not manager.is_file_exported(
+                "test_thread_cleanup", sid, "/workspace/thread_cleanup.txt"
+            )
+        finally:
+            current_thread_id.reset(token)
+
+
+# ── LangChain tool-level tests ────────────────────────────────
+
+
+class TestExportFilesTool:
+    @pytest.fixture(scope="class")
+    def class_manager(self, manager):
+        return manager
+
+    @pytest.fixture(scope="class")
+    def tools(self, class_manager):
+        return {t.name: t for t in create_tools(class_manager)}
+
+    def test_tool_exists(self, tools):
+        assert "export_files" in tools
+        assert tools["export_files"].description
+
+    def test_tool_full_workflow(self, tools, class_manager):
+        create = tools["create_session"]
+        execute_terminal = tools["execute_terminal"]
+        export = tools["export_files"]
+        stop = tools["stop_session"]
+
+        r = json.loads(create.invoke({"language": "python"}))
+        sid = r["session_id"]
+
+        try:
+            json.loads(execute_terminal.invoke({
+                "session_id": sid,
+                "command": "echo 'tool_export_test' > /workspace/tool_file.txt",
+            }))
+
+            r = json.loads(export.invoke({
+                "session_id": sid,
+                "files": [{"source": "tool_file.txt", "destination": "tool_file.txt"}],
+            }))
+
+            assert r["success"] is True
+            assert len(r["files"]) == 1
+            assert r["files"][0]["success"] is True
+            assert r["files"][0]["session_id"] == sid
+            assert "path" in r["files"][0]
+            assert "tool_file.txt" in r["files"][0]["path"]
+        finally:
+            json.loads(stop.invoke({"session_id": sid}))

@@ -1,0 +1,497 @@
+"""Integration tests for SandboxManager.
+
+Requires Docker to be running on the host.
+Run with: pytest tests/test_manager.py -v
+"""
+
+from __future__ import annotations
+
+import tempfile
+import uuid
+from pathlib import Path
+
+import pytest
+
+from taskharbor.sandbox.manager import SandboxManager, current_thread_id, current_user_id
+from taskharbor.sandbox.models import ExecutionResult, TerminalResult
+
+
+def _docker_available() -> bool:
+    try:
+        import docker
+
+        docker.from_env().ping()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _docker_available(),
+    reason="Docker is not available",
+)
+
+
+@pytest.fixture(scope="module")
+def manager(tmp_path_factory):
+    """Real Docker with isolated storage and explicitly allowed import fixtures."""
+    from taskharbor.settings import get_settings
+
+    settings = get_settings()
+    storage = tmp_path_factory.mktemp("manager-storage")
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(settings, "STORAGE_DIR", storage)
+        patcher.setattr(settings, "SANDBOX_STANDALONE_OWNER", "manager-test-owner")
+        patcher.setattr(settings, "IMPORT_ALLOWED_DIRS", [Path(tempfile.gettempdir())])
+        patcher.setattr(SandboxManager, "_get_db_pool", lambda self: None)
+        mgr = SandboxManager()
+        yield mgr
+        mgr.cleanup_all()
+
+
+@pytest.fixture(autouse=True)
+def isolated_thread_identity():
+    owner = current_user_id.set("manager-test-owner")
+    thread = current_thread_id.set("manager-test-" + uuid.uuid4().hex)
+    yield
+    current_thread_id.reset(thread)
+    current_user_id.reset(owner)
+
+
+class TestCreateSession:
+    def test_create_python_session(self, manager: SandboxManager):
+        info = manager.create_session(runtime="python")
+        try:
+            assert info.session_id in manager.sessions
+            assert info.runtime == "python"
+            assert info.status == "warm"
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_create_node_session(self, manager: SandboxManager):
+        info = manager.create_session(runtime="node")
+        try:
+            assert info.session_id in manager.sessions
+            assert info.runtime == "node"
+            assert info.status == "warm"
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_create_session_with_deps(self, manager: SandboxManager):
+        info = manager.create_session(runtime="python", dependencies={"requests": ""})
+        try:
+            assert "requests" in info.dependencies
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_invalid_runtime(self, manager: SandboxManager):
+        with pytest.raises(ValueError, match="not supported"):
+            manager.create_session(runtime="ruby")
+
+
+class TestExecuteCode:
+    def test_simple_expression(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_code(python_session, "1 + 1")
+        assert isinstance(result, ExecutionResult)
+        assert result.success is True
+        assert result.result is not None
+        assert "2" in result.result["text/plain"]
+
+    def test_stdout_capture(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_code(python_session, 'print("hello world")')
+        assert result.success is True
+        assert "hello world" in result.stdout
+
+    def test_persistent_state(self, manager: SandboxManager, python_session: str):
+        manager.execute_code(python_session, "x = 42")
+        result = manager.execute_code(python_session, "x * 2")
+        assert result.success is True
+        assert "84" in result.result["text/plain"]
+
+    def test_error_handling(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_code(python_session, "1 / 0")
+        assert result.success is False
+        assert result.error is not None
+        assert "ZeroDivisionError" in result.error["type"]
+
+    def test_timeout(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_code(
+            python_session, "import time; time.sleep(60)", timeout=2
+        )
+        assert result.success is False
+
+
+class TestExecuteTerminal:
+    def test_ls(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_terminal(python_session, "ls /workspace")
+        assert isinstance(result, TerminalResult)
+        assert result.exit_code == 0
+
+    def test_echo(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_terminal(python_session, "echo 'test123'")
+        assert result.exit_code == 0
+        assert "test123" in result.stdout
+
+    def test_failed_command(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_terminal(python_session, "false")
+        assert result.exit_code != 0
+
+
+class TestInstallPackages:
+    def test_install_via_terminal(self, manager: SandboxManager, python_session: str):
+        result = manager.execute_terminal(
+            python_session, "pip install --no-cache-dir requests"
+        )
+        assert result.exit_code == 0
+        assert "Successfully installed" in result.stdout or "already satisfied" in result.stdout
+
+        code_result = manager.execute_code(
+            python_session,
+            "import requests; print(requests.__version__)",
+        )
+        assert code_result.success is True
+        assert code_result.stdout.strip()
+
+    def test_initial_deps_installed(self, manager: SandboxManager):
+        info = manager.create_session(runtime="python", dependencies={"requests": ""})
+        try:
+            result = manager.execute_code(
+                info.session_id,
+                "import requests; print(requests.__version__)",
+            )
+            assert result.success is True
+            assert result.stdout.strip()
+        finally:
+            manager.stop_session(info.session_id)
+
+
+class TestImportFiles:
+    def test_import_single_file(self, manager: SandboxManager, python_session: str):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write("a,b,c\n1,2,3\n")
+            f.flush()
+            local_path = f.name
+
+        result = manager.import_files(python_session, [
+            {"source": local_path, "destination": Path(local_path).name},
+        ])
+        assert result.success is True
+        assert len(result.files) == 1
+        assert result.files[0].success is True
+
+        ls_result = manager.execute_terminal(python_session, "ls /workspace/")
+        assert Path(local_path).name in ls_result.stdout
+
+    def test_import_directory(self, manager: SandboxManager, python_session: str):
+        import os
+
+        tmpdir = tempfile.mkdtemp(prefix="sandbox_import_test_")
+        try:
+            with open(os.path.join(tmpdir, "a.txt"), "w") as f:
+                f.write("aaa")
+            with open(os.path.join(tmpdir, "b.txt"), "w") as f:
+                f.write("bbb")
+
+            result = manager.import_files(python_session, [
+                {"source": tmpdir, "destination": "imported_dir"},
+            ])
+            assert result.success is True
+
+            ls_result = manager.execute_terminal(python_session, "ls /workspace/imported_dir/")
+            assert "a.txt" in ls_result.stdout
+            assert "b.txt" in ls_result.stdout
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_import_multiple_files(self, manager: SandboxManager, python_session: str):
+        files = []
+        for i in range(2):
+            f = tempfile.NamedTemporaryFile(mode="w", suffix=f"_{i}.txt", delete=False)
+            f.write(f"content_{i}")
+            f.flush()
+            files.append(f.name)
+            f.close()
+
+        result = manager.import_files(python_session, [
+            {"source": files[0], "destination": Path(files[0]).name},
+            {"source": files[1], "destination": Path(files[1]).name},
+        ])
+        assert result.success is True
+        assert len(result.files) == 2
+        assert all(fr.success for fr in result.files)
+
+    def test_import_nonexistent_source(self, manager: SandboxManager, python_session: str):
+        result = manager.import_files(python_session, [
+            {"source": "/tmp/definitely_does_not_exist_12345.txt", "destination": "x.txt"},
+        ])
+        assert result.success is False
+        assert result.files[0].success is False
+        assert "not found" in result.files[0].error.lower()
+
+    def test_import_from_exported_session(self, manager: SandboxManager):
+        """Cross-session: export in session A, import into session B."""
+        token = current_thread_id.set("test_cross_session")
+        sid_a, sid_b = None, None
+        try:
+            info_a = manager.create_session(runtime="python")
+            sid_a = info_a.session_id
+            manager.execute_terminal(sid_a, "echo 'cross,session' > /workspace/data.csv")
+            export_result = manager.export_files(sid_a, [{"source": "data.csv"}])
+            assert export_result.success
+            path = export_result.files[0].path
+            manager.stop_session(sid_a)
+            info_b = manager.create_session(runtime="python")
+            sid_b = info_b.session_id
+            assert sid_b != sid_a
+            manager.execute_terminal(sid_b, "rm /workspace/data.csv")
+
+            import_result = manager.import_files(sid_b, [
+                {"session_id": sid_a, "path": path, "destination": "data.csv"},
+            ])
+            assert import_result.success
+            assert import_result.files[0].success
+
+            ls_result = manager.execute_terminal(sid_b, "cat /workspace/data.csv")
+            assert "cross,session" in ls_result.stdout
+        finally:
+            current_thread_id.reset(token)
+            if sid_a:
+                manager.stop_session(sid_a)
+            if sid_b:
+                manager.stop_session(sid_b)
+
+
+class TestRRuntime:
+    """Tests for the R runtime — mirrors the Python test suite."""
+
+    def test_create_r_session(self, manager: SandboxManager):
+        info = manager.create_session(runtime="r")
+        try:
+            assert info.session_id in manager.sessions
+            assert info.runtime == "r"
+            assert info.status == "warm"
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_simple_expression(self, manager: SandboxManager, r_session: str):
+        result = manager.execute_code(r_session, "1 + 1")
+        assert isinstance(result, ExecutionResult)
+        assert result.success is True
+        assert result.result is not None
+        assert "2" in result.result["text/plain"]
+
+    def test_stdout_capture(self, manager: SandboxManager, r_session: str):
+        result = manager.execute_code(r_session, 'cat("hello world")')
+        assert result.success is True
+        assert "hello world" in result.stdout
+
+    def test_persistent_state(self, manager: SandboxManager, r_session: str):
+        manager.execute_code(r_session, "x <- 42")
+        result = manager.execute_code(r_session, "x * 2")
+        assert result.success is True
+        assert "84" in result.result["text/plain"]
+
+    def test_error_handling(self, manager: SandboxManager, r_session: str):
+        result = manager.execute_code(r_session, 'stop("test error")')
+        assert result.success is False
+        assert result.error is not None
+        assert "simpleError" in result.error["type"] or "error" in result.error["type"].lower()
+
+    def test_timeout(self, manager: SandboxManager, r_session: str):
+        result = manager.execute_code(r_session, "repeat { x <- 1 }", timeout=2)
+        assert result.success is False
+
+    def test_terminal_ls(self, manager: SandboxManager, r_session: str):
+        result = manager.execute_terminal(r_session, "ls /workspace")
+        assert isinstance(result, TerminalResult)
+        assert result.exit_code == 0
+
+    def test_install_packages(self, manager: SandboxManager):
+        info = manager.create_session(runtime="r", dependencies={"crayon": ""})
+        try:
+            result = manager.execute_code(
+                info.session_id,
+                'library(crayon); cat(green("ok"))',
+            )
+            assert result.success is True
+            assert "ok" in result.stdout
+        finally:
+            manager.stop_session(info.session_id)
+
+
+class TestNodeRuntime:
+    """Tests for the Node.js runtime — exercises kernel_node.js specifics."""
+
+    def test_create_node_session(self, manager: SandboxManager):
+        info = manager.create_session(runtime="node")
+        try:
+            assert info.session_id in manager.sessions
+            assert info.runtime == "node"
+            assert info.status == "warm"
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_simple_expression(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, "1 + 1")
+        assert isinstance(result, ExecutionResult)
+        assert result.success is True
+        assert result.result is not None
+        assert "2" in result.result["text/plain"]
+
+    def test_stdout_capture(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, 'console.log("hello world")')
+        assert result.success is True
+        assert "hello world" in result.stdout
+
+    def test_stderr_capture(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, 'console.error("oops")')
+        assert result.success is True
+        assert "oops" in result.stderr
+
+    def test_persistent_state(self, manager: SandboxManager, node_session: str):
+        manager.execute_code(node_session, "var x = 42")
+        result = manager.execute_code(node_session, "x * 2")
+        assert result.success is True
+        assert "84" in result.result["text/plain"]
+
+    def test_const_let_redeclaration(self, manager: SandboxManager, node_session: str):
+        """const/let are rewritten to var so re-declaration across cells works."""
+        r1 = manager.execute_code(node_session, "const greeting = 'hello'")
+        assert r1.success is True
+        r2 = manager.execute_code(node_session, "const greeting = 'world'")
+        assert r2.success is True
+        r3 = manager.execute_code(node_session, "greeting")
+        assert r3.success is True
+        assert "world" in r3.result["text/plain"]
+
+    def test_error_handling(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, 'throw new Error("boom")')
+        assert result.success is False
+        assert result.error is not None
+        assert "Error" in result.error["type"]
+        assert "boom" in result.error["message"]
+
+    def test_reference_error(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, "undeclaredVariable")
+        assert result.success is False
+        assert result.error is not None
+        assert "ReferenceError" in result.error["type"]
+
+    def test_type_error(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, "null.foo")
+        assert result.success is False
+        assert "TypeError" in result.error["type"]
+
+    def test_timeout(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, "while(true) {}", timeout=2)
+        assert result.success is False
+
+    def test_async_await(self, manager: SandboxManager, node_session: str):
+        code = "await new Promise(resolve => setTimeout(() => resolve(99), 100))"
+        result = manager.execute_code(node_session, code)
+        assert result.success is True
+        assert result.result is not None
+        assert "99" in result.result["text/plain"]
+
+    def test_promise_result(self, manager: SandboxManager, node_session: str):
+        code = "Promise.resolve(42)"
+        result = manager.execute_code(node_session, code)
+        assert result.success is True
+        assert result.result is not None
+        assert "42" in result.result["text/plain"]
+
+    def test_object_result(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, '({name: "test", value: 123})')
+        assert result.success is True
+        assert result.result is not None
+        assert "test" in result.result["text/plain"]
+        assert "123" in result.result["text/plain"]
+
+    def test_array_result(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_code(node_session, "[1, 2, 3]")
+        assert result.success is True
+        assert result.result is not None
+        plain = result.result["text/plain"]
+        assert "1" in plain and "2" in plain and "3" in plain
+
+    def test_require_builtin(self, manager: SandboxManager, node_session: str):
+        code = 'const path = require("path"); path.join("/workspace", "test.txt")'
+        result = manager.execute_code(node_session, code)
+        assert result.success is True
+        assert result.result is not None
+        assert "test.txt" in result.result["text/plain"]
+
+    def test_multiline_function(self, manager: SandboxManager, node_session: str):
+        code = "function add(a, b) { return a + b; }\nadd(3, 4)"
+        result = manager.execute_code(node_session, code)
+        assert result.success is True
+        assert "7" in result.result["text/plain"]
+
+    def test_terminal_ls(self, manager: SandboxManager, node_session: str):
+        result = manager.execute_terminal(node_session, "ls /workspace")
+        assert isinstance(result, TerminalResult)
+        assert result.exit_code == 0
+
+    def test_install_packages(self, manager: SandboxManager):
+        info = manager.create_session(runtime="node", dependencies={"lodash": ""})
+        try:
+            result = manager.execute_code(
+                info.session_id,
+                'const _ = require("lodash"); _.sum([1, 2, 3])',
+            )
+            assert result.success is True
+            assert result.result is not None
+            assert "6" in result.result["text/plain"]
+        finally:
+            manager.stop_session(info.session_id)
+
+    def test_import_and_read_file(self, manager: SandboxManager, node_session: str):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            f.write('{"key": "value"}')
+            f.flush()
+            local_path = f.name
+
+        result = manager.import_files(node_session, [
+            {"source": local_path, "destination": Path(local_path).name},
+        ])
+        assert result.success is True
+
+        filename = Path(local_path).name
+        code = f'JSON.parse(require("fs").readFileSync("/workspace/{filename}", "utf8"))'
+        exec_result = manager.execute_code(node_session, code)
+        assert exec_result.success is True
+        assert "value" in exec_result.result["text/plain"]
+
+
+class TestStopSession:
+    def test_stop_removes_session(self, manager: SandboxManager):
+        info = manager.create_session(runtime="python")
+        sid = info.session_id
+        assert sid in manager.sessions
+
+        manager.stop_session(sid)
+        assert sid not in manager.sessions
+
+    def test_stop_nonexistent(self, manager: SandboxManager):
+        assert manager.stop_session("nonexistent") is False
+
+
+class TestCleanup:
+    def test_cleanup_all(self, tmp_path, monkeypatch):
+        from taskharbor.settings import get_settings
+
+        monkeypatch.setattr(get_settings(), "STORAGE_DIR", tmp_path)
+        mgr = SandboxManager()
+        try:
+            first = mgr.create_session(runtime="python")
+            assert mgr.create_session(runtime="python").session_id == first.session_id
+            token = current_thread_id.set("cleanup-second-thread")
+            try:
+                mgr.create_session(runtime="python")
+            finally:
+                current_thread_id.reset(token)
+            assert len(mgr.sessions) == 2
+        finally:
+            mgr.cleanup_all()
+        assert len(mgr.sessions) == 0

@@ -1,0 +1,426 @@
+import { useState, useEffect } from "react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Play,
+  Terminal,
+  Box,
+  Square,
+  Upload,
+  Download,
+  Wrench,
+  CheckCircle2,
+  XCircle,
+  Loader2,
+} from "lucide-react";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+import type { ToolCall, ToolApproval } from "../types";
+import type { MissingToolStatus } from "../lib/tool-status";
+import {
+  parseToolOutput,
+  extractDisplayOutputs,
+  formatFileSize,
+} from "../lib/utils";
+import { getDownloadUrl } from "../api/aegra";
+import { DisplayOutputList } from "./DisplayOutputRenderer";
+import { APPROVAL_LABELS } from "../lib/approvals";
+
+interface ToolCallBlockProps {
+  toolCall: ToolCall;
+  result?: string;
+  resultStatus?: "success" | "error";
+  missingStatus: MissingToolStatus;
+  resultContent?: string | { type: string; text?: string; image_url?: { url: string } }[];
+  threadId: string | null;
+  sessionRuntimes: Map<string, string>;
+  /** Keep dropdown open until another tool call, final response, or flow end */
+  shouldStayOpen: boolean;
+  approval?: ToolApproval;
+}
+
+const RUNTIME_LANG: Record<string, string> = {
+  python: "python",
+  node: "javascript",
+  r: "r",
+};
+
+const MAX_OUTPUT_LINES = 60;
+
+function truncateOutput(text: string): string {
+  const lines = text.split("\n");
+  if (lines.length <= MAX_OUTPUT_LINES) return text;
+  return lines.slice(0, MAX_OUTPUT_LINES).join("\n") + `\n\n... +${lines.length - MAX_OUTPUT_LINES} lines omitted ...`;
+}
+
+function getToolMeta(name: string) {
+  switch (name) {
+    case "execute_code":
+      return { icon: <Play size={14} className="text-green-400" />, label: "execute_code" };
+    case "execute_terminal":
+      return { icon: <Terminal size={14} className="text-yellow-400" />, label: "execute_terminal" };
+    case "execute_host_command":
+      return { icon: <Terminal size={14} className="text-amber-400" />, label: "execute_host_command · This computer" };
+    case "create_session":
+      return { icon: <Box size={14} className="text-blue-400" />, label: "create_session" };
+    case "stop_session":
+      return { icon: <Square size={14} className="text-red-400" />, label: "stop_session" };
+    case "import_files":
+      return { icon: <Upload size={14} className="text-cyan-400" />, label: "import_files" };
+    case "export_files":
+      return { icon: <Download size={14} className="text-emerald-400" />, label: "export_files" };
+    case "task":
+      return { icon: <Box size={14} className="text-blue-400" />, label: "Start subtask" };
+    case "wait_tasks":
+      return { icon: <Loader2 size={14} className="text-blue-400" />, label: "Wait for subtasks" };
+    case "cancel_task":
+      return { icon: <Square size={14} className="text-red-400" />, label: "Cancel subtask" };
+    default:
+      return { icon: <Wrench size={14} className="text-zinc-400" />, label: name };
+  }
+}
+
+type ToolStatus = MissingToolStatus | "ok" | "error";
+
+const MISSING_LABELS = {
+  running: "Running...",
+  stopping: "Stopping...",
+  interrupted: "Interrupted",
+  unknown: "Result unknown",
+};
+
+function StatusBadge({ status }: { status: ToolStatus }) {
+  if (status === "running")
+    return (
+      <span className="flex items-center gap-1 text-yellow-400">
+        <Loader2 size={10} className="animate-spin" /> Running...
+      </span>
+    );
+  if (status === "stopping" || status === "interrupted" || status === "unknown")
+    return (
+      <span className="flex items-center gap-1 text-zinc-400">
+        <Square size={10} /> {MISSING_LABELS[status]}
+      </span>
+    );
+  if (status === "error")
+    return (
+      <span className="flex items-center gap-1 text-red-400">
+        <XCircle size={10} /> ERROR
+      </span>
+    );
+  return (
+    <span className="flex items-center gap-1 text-green-400">
+      <CheckCircle2 size={10} /> OK
+    </span>
+  );
+}
+
+export function ToolCallBlock({
+  toolCall,
+  result,
+  resultStatus,
+  missingStatus,
+  resultContent,
+  threadId,
+  sessionRuntimes,
+  shouldStayOpen,
+  approval,
+}: ToolCallBlockProps) {
+  const isRunning = result === undefined &&
+    (approval ? approval.status === "executing" : missingStatus === "running");
+  const [expanded, setExpanded] = useState(isRunning || shouldStayOpen);
+
+  useEffect(() => {
+    if (!shouldStayOpen) setExpanded(false);
+  }, [shouldStayOpen]);
+
+  const { icon, label } = getToolMeta(toolCall.name);
+
+  let status: ToolStatus = missingStatus;
+  let parsedOutput: Record<string, unknown> | null = null;
+  let outputIsError = false;
+
+  if (result !== undefined) {
+    const parsed = parseToolOutput(result);
+    parsedOutput = parsed.data;
+    outputIsError = parsed.isError || resultStatus === "error";
+    status = outputIsError ? "error" : "ok";
+  }
+
+  const inputDisplay = getInputDisplay(toolCall, sessionRuntimes);
+
+  const displayOutputs = resultContent ? extractDisplayOutputs(resultContent) : [];
+  if (parsedOutput?.display_outputs && Array.isArray(parsedOutput.display_outputs)) {
+    for (const out of parsedOutput.display_outputs) {
+      if (out && typeof out === "object" && typeof (out as Record<string,unknown>).type === "string") {
+        const o = out as { type: string; data: string };
+        const isDuplicate = displayOutputs.some(
+          (existing) => existing.type === o.type && existing.data === o.data,
+        );
+        if (!isDuplicate) {
+          displayOutputs.push(o);
+        }
+      }
+    }
+  }
+
+  return (
+    <div className="my-1.5">
+      <div className="w-fit max-w-full rounded-lg border border-zinc-800 bg-zinc-900/50 text-xs">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex w-full items-center gap-2 px-3 py-2 text-zinc-400 transition-colors hover:text-zinc-200"
+        >
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          {icon}
+          <span className="flex-1 text-left">{label}</span>
+          {approval && result === undefined ? (
+            <span className="text-amber-300">{APPROVAL_LABELS[approval.status]}</span>
+          ) : <StatusBadge status={status} />}
+        </button>
+
+        {expanded && (
+          <div className="border-t border-zinc-800">
+            <div className="px-3 pt-2 pb-1">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                Input
+              </span>
+            </div>
+            <div className="tool-code-block px-1 pb-2">
+              <SyntaxHighlighter
+                language={inputDisplay.lang}
+                style={oneDark}
+                customStyle={{
+                  margin: 0,
+                  padding: "0.5rem 0.75rem",
+                  fontSize: "0.75rem",
+                  background: "transparent",
+                  border: "none",
+                }}
+                wrapLongLines
+              >
+                {inputDisplay.code}
+              </SyntaxHighlighter>
+            </div>
+
+            <div className="px-3 pt-1 pb-1">
+              <span className="text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+                Output
+              </span>
+            </div>
+            <div className="tool-code-block px-1 pb-2">
+              {isRunning ? (
+                <div className="flex items-center gap-2 px-3 py-2 text-zinc-500">
+                  <Loader2 size={12} className="animate-spin" />
+                  Running...
+                </div>
+              ) : (
+                <OutputDisplay
+                  parsedOutput={parsedOutput}
+                  rawResult={result ?? (approval ? APPROVAL_LABELS[approval.status] : missingStatus === "stopping"
+                    ? "Waiting for cancellation confirmation."
+                    : "No result was received. The underlying operation may still be running.")}
+                />
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Session info cards */}
+      {toolCall.name === "create_session" && parsedOutput != null && (
+        <SessionCard
+          sessionId={String(parsedOutput.session_id ?? "")}
+          runtime={String(parsedOutput.runtime ?? "")}
+          status={String(parsedOutput.status ?? "")}
+          type="create"
+        />
+      )}
+      {toolCall.name === "stop_session" && parsedOutput != null && (
+        <SessionCard
+          sessionId={String(parsedOutput.session_id ?? "")}
+          runtime=""
+          status="stopped"
+          type="stop"
+        />
+      )}
+
+      {/* File results for import/export */}
+      {(toolCall.name === "import_files" || toolCall.name === "export_files") &&
+        parsedOutput != null &&
+        Array.isArray(parsedOutput.files) && (
+          <FileResults
+            files={parsedOutput.files as Record<string, unknown>[]}
+            isExport={toolCall.name === "export_files"}
+            threadId={threadId}
+          />
+        )}
+
+      {/* Display outputs (images, HTML, audio, video, etc.) */}
+      <DisplayOutputList outputs={displayOutputs} />
+    </div>
+  );
+}
+
+function getInputDisplay(
+  toolCall: ToolCall,
+  sessionRuntimes: Map<string, string>,
+): { code: string; lang: string } {
+  const args = toolCall.args;
+
+  if (toolCall.name === "execute_code" && typeof args.code === "string") {
+    const sessionId = String(args.session_id ?? "");
+    const runtime = sessionRuntimes.get(sessionId) ?? "";
+    const lang = RUNTIME_LANG[runtime] ?? "python";
+    return { code: args.code, lang };
+  }
+
+  if (toolCall.name === "execute_terminal" && typeof args.command === "string") {
+    return { code: args.command, lang: "bash" };
+  }
+
+  if (toolCall.name === "execute_host_command" && typeof args.command === "string") {
+    return { code: args.command, lang: "powershell" };
+  }
+
+  return {
+    code: JSON.stringify(args, null, 2),
+    lang: "json",
+  };
+}
+
+function OutputDisplay({
+  parsedOutput,
+  rawResult,
+}: {
+  parsedOutput: Record<string, unknown> | null;
+  rawResult: string;
+}) {
+  let displayText: string;
+
+  if (parsedOutput) {
+    const clean = { ...parsedOutput };
+    delete clean.display_outputs;
+    displayText = JSON.stringify(clean, null, 2);
+  } else {
+    displayText = rawResult;
+  }
+
+  displayText = truncateOutput(displayText);
+
+  return (
+    <SyntaxHighlighter
+      language="json"
+      style={oneDark}
+      customStyle={{
+        margin: 0,
+        padding: "0.5rem 0.75rem",
+        fontSize: "0.75rem",
+        background: "transparent",
+        border: "none",
+      }}
+      wrapLongLines
+    >
+      {displayText}
+    </SyntaxHighlighter>
+  );
+}
+
+function SessionCard({
+  sessionId,
+  runtime,
+  status,
+  type,
+}: {
+  sessionId: string;
+  runtime: string;
+  status: string;
+  type: "create" | "stop";
+}) {
+  const statusIcon =
+    type === "stop"
+      ? "🔴"
+      : status === "running" || status === "active"
+        ? "🟢"
+        : status === "starting" || status === "warm"
+          ? "🟡"
+          : "⚪";
+
+  const bg = type === "stop" ? "bg-red-950/30 border-red-900/50" : "bg-blue-950/30 border-blue-900/50";
+
+  return (
+    <div className={`mt-1.5 w-fit rounded-lg border px-3 py-2 text-xs ${bg}`}>
+      <span>
+        {statusIcon} Session{" "}
+        <code className="rounded bg-zinc-800 px-1 py-0.5">{sessionId}</code>
+        {runtime && <span className="text-zinc-400"> ({runtime})</span>}
+        {" — "}
+        <span className="text-zinc-300">{type === "stop" ? "stopped" : status}</span>
+      </span>
+    </div>
+  );
+}
+
+function FileResults({
+  files,
+  isExport,
+  threadId,
+}: {
+  files: Record<string, unknown>[];
+  isExport: boolean;
+  threadId: string | null;
+}) {
+  return (
+    <div className="mt-1.5 space-y-1">
+      {files.map((fr, i) => {
+        const success = fr.success as boolean;
+        const filename =
+          String(fr.path ?? fr.source ?? fr.destination ?? "file");
+        const displayName = filename.includes("/")
+          ? filename.split("/").pop()!
+          : filename;
+        const size = fr.size as number | undefined;
+        const sessionId = fr.session_id as string | undefined;
+        const path = fr.path as string | undefined;
+        const artifactId = fr.artifact_id as string | undefined;
+        const error = fr.error as string | undefined;
+
+        if (!success) {
+          return (
+            <div
+              key={i}
+              className="w-fit rounded-lg border border-red-900/50 bg-red-950/30 px-3 py-1.5 text-xs text-red-300"
+            >
+              ❌ {displayName} — {error ?? "Failed"}
+            </div>
+          );
+        }
+
+        return (
+          <div
+            key={i}
+            className="flex w-fit items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-1.5 text-xs"
+          >
+            <span className="text-zinc-300">
+              ✅ {displayName}
+              {size ? (
+                <span className="ml-1 text-zinc-500">
+                  ({formatFileSize(size)})
+                </span>
+              ) : null}
+            </span>
+            {isExport && sessionId && path && threadId && (
+              <a
+                href={getDownloadUrl(threadId, sessionId, path, artifactId)}
+                className="ml-auto rounded bg-green-700 px-2 py-0.5 text-[10px] font-medium text-white transition-colors hover:bg-green-600"
+                download
+              >
+                Download
+              </a>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}

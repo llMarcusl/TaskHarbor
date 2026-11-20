@@ -1,0 +1,106 @@
+"""Shared helpers for tool error responses.
+
+Provides a single ``error_payload`` that returns a ``dict`` for
+LangChain tools, ``validation_error_payload`` for Pydantic input
+validation failures, and a thin ``error_response`` wrapper that serialises
+the payload to a JSON string for LangChain tools.
+"""
+
+from __future__ import annotations
+
+import json
+import traceback
+from typing import Any
+
+from pydantic import ValidationError
+
+from taskharbor.sandbox.manager import (
+    ContainerDiedError,
+    SandboxManager,
+    current_execution_scope,
+    current_thread_id,
+    current_user_id,
+)
+from taskharbor.sandbox.models import truncate_field
+from taskharbor.settings import get_settings
+
+
+def active_sessions_summary(
+    manager: SandboxManager, *, filter_by_thread: bool = True
+) -> list[dict[str, str]]:
+    """Return a compact summary of active sessions.
+
+    When *filter_by_thread* is ``True`` (default), only sessions visible
+    to the current thread are returned.  When ``False``, all sessions are
+    returned regardless of thread ownership.
+    """
+    thread_id = current_thread_id.get(None) if filter_by_thread else None
+    owner = current_user_id.get(None)
+    return [
+        {"session_id": info.session_id, "runtime": info.runtime, "status": info.status}
+        for info in manager.sessions.values()
+        if (thread_id is None or info.thread_id == thread_id)
+        and (owner is None or getattr(info, "user_id", None) == owner)
+        and (not filter_by_thread or getattr(info, "execution_scope", None)
+             == current_execution_scope.get())
+    ]
+
+
+def error_payload(
+    manager: SandboxManager, exc: Exception, *, filter_by_thread: bool = True
+) -> dict[str, Any]:
+    """Build a structured error payload that includes active sessions hint.
+
+    Returns a ``dict`` suitable for LangChain tools (serialised via ``error_response``).
+    """
+    sessions = active_sessions_summary(manager, filter_by_thread=filter_by_thread)
+    settings = get_settings()
+
+    if isinstance(exc, ContainerDiedError):
+        return {
+            "success": False,
+            "error": f"CONTAINER_DIED: {exc.reason}",
+            "session_id": exc.session_id,
+            "hint": (
+                "The sandbox container crashed and is no longer usable. "
+                "Call stop_session to clean it up, then create_session to start a fresh one. "
+                "BEFORE re-running code, diagnose the root cause: "
+                "(1) Did you import_files to THIS session? Each session has its own "
+                "filesystem — files imported to another session are NOT available here. "
+                "(2) Did the code exhaust memory? "
+                "(3) Did callback-based async code throw an unhandled error? "
+                "NEVER re-run the exact same code that crashed a container."
+            ),
+            "active_sessions": sessions,
+        }
+
+    payload: dict[str, Any] = {
+        "success": False,
+        "error": f"{type(exc).__name__}: {exc}",
+        "active_sessions": sessions,
+    }
+
+    if sessions:
+        payload["hint"] = "Use one of the active session_ids listed above."
+    else:
+        payload["hint"] = "No active sessions. Call create_session first."
+
+    if "not found" not in str(exc).lower():
+        raw_tb = traceback.format_exc()
+        payload["traceback"] = truncate_field(raw_tb, settings.MAX_TRACEBACK_CHARS)
+
+    return payload
+
+
+def validation_error_payload(exc: ValidationError) -> dict[str, Any]:
+    """Build a structured error payload from a Pydantic ``ValidationError``.
+
+    Returns a ``dict`` with the same ``success`` / ``error`` / ``hint``
+    structure used by ``error_payload`` so the LLM can self-correct.
+    """
+    return {"success": False, "error": "INVALID_INPUT", "details": exc.errors(include_url=False)}
+
+
+def error_response(manager: SandboxManager, exc: Exception) -> str:
+    """Build a JSON-serialised error response (for LangChain tools)."""
+    return json.dumps(error_payload(manager, exc), ensure_ascii=False)
